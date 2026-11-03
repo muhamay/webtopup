@@ -223,7 +223,7 @@ app.get("/", (req, res) => {
   </p>
 
   <form id="letterForm">
-  <label>NAMA PENGIRIM</label>
+  <label>NAMA PENGIRIM!!</label>
     <input id="sender" maxlength="40"
       placeholder="Tidak Wajib..">
       
