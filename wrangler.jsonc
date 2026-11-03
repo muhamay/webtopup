@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "webtopup",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-03",
+  "workers_dev": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "secret-love-letter-db",
+      "database_id": "b7e2b988-7c77-46f2-b909-22750b28758f"
+    }
+  ]
+}
