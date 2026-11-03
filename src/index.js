@@ -1,582 +1,351 @@
 
-import express from "express";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import Database from "better-sqlite3";
-import dotenv from "dotenv";
-import crypto from "node:crypto";
-
-dotenv.config();
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-const db = new Database(process.env.DATABASE_FILE || "letters.db");
-
-const MAX_DELIVERIES = 15;
-const WINDOW_MS = 2 * 60 * 60 * 1000;
-const EXPIRY_DAYS = Math.min(
-  Math.max(Number(process.env.LETTER_EXPIRY_DAYS) || 30, 1),
-  90
-);
-
-if (!process.env.ADMIN_KEY || process.env.ADMIN_KEY.length < 24) {
-  throw new Error("ADMIN_KEY harus diisi dengan minimal 24 karakter.");
-}
-
-if (!/^[1-9][0-9]{7,14}$/.test(process.env.WHATSAPP_NUMBER || "")) {
-  throw new Error("WHATSAPP_NUMBER tidak valid.");
-}
-
-db.pragma("journal_mode = WAL");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS letters (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    code TEXT UNIQUE NOT NULL,
-    sender TEXT,
-    message TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS delivery_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    letter_code TEXT UNIQUE NOT NULL,
-    delivered_at INTEGER NOT NULL
-  );
-`);
-
-app.use(helmet({
-  contentSecurityPolicy: false
-}));
-
-app.use(express.urlencoded({ extended: false, limit: "10kb" }));
-app.use(express.json({ limit: "10kb" }));
-
-const createLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 5,
-  standardHeaders: true,
-  legacyHeaders: false
-});
-
-const adminLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 30,
-  standardHeaders: true,
-  legacyHeaders: false
-});
-
-function generateCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code = "SL-";
-
-  for (let i = 0; i < 8; i++) {
-    code += chars[crypto.randomInt(chars.length)];
-  }
-
-  return code;
-}
-
-function escapeHTML(value = "") {
-  return String(value).replace(/[&<>"']/g, char => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;"
-  })[char]);
-}
-
-function getQuota() {
-  const start = Date.now() - WINDOW_MS;
-
-  const used = db.prepare(`
-    SELECT COUNT(*) AS total
-    FROM delivery_history
-    WHERE delivered_at > ?
-  `).get(start).total;
-
-  const oldest = db.prepare(`
-    SELECT MIN(delivered_at) AS oldest
-    FROM delivery_history
-    WHERE delivered_at > ?
-  `).get(start).oldest;
-
-  return {
-    limit: MAX_DELIVERIES,
-    used,
-    remaining: Math.max(0, MAX_DELIVERIES - used),
-    available: used < MAX_DELIVERIES,
-    nextReset: used >= MAX_DELIVERIES && oldest
-      ? oldest + WINDOW_MS
-      : null
-  };
-}
-
-function adminOnly(req, res, next) {
-  const key = req.get("x-admin-key") || "";
-
-  const a = Buffer.from(key);
-  const b = Buffer.from(process.env.ADMIN_KEY);
-
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    return res.status(401).json({
-      error: "Akses admin ditolak."
-    });
-  }
-
-  next();
-}
-
-function page(title, content, script = "") {
-  return `<!DOCTYPE html>
+const page = `<!DOCTYPE html>
 <html lang="id">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#fff1f5">
-<title>${escapeHTML(title)}</title>
+<title>Secret Love Letter</title>
 <style>
-.music-btn {
-  background-color: #ff4b5c;
-  color: #ffffff;
-  border: none;
-  padding: 8px 16px;
-  border-radius: 20px;
-  font-size: 14px;
-  cursor: pointer;
-  margin-bottom: 15px;
-  transition: all 0.3s ease;
-  box-shadow: 0 4px 6px rgba(255, 75, 92, 0.2);
-}
-
-.music-btn:hover {
-  background-color: #e03e4d;
-  transform: scale(1.05);
-}
 *{box-sizing:border-box}
-body{
-  margin:0;padding:22px;min-height:100vh;
-  display:flex;align-items:center;justify-content:center;
-  font-family:Arial,sans-serif;
-  color:#513342;
-  background:linear-gradient(135deg,#fff1f5,#ffe0eb)
-}
-.card{
-  width:100%;max-width:480px;background:white;
-  border-radius:24px;padding:28px 23px;
-  box-shadow:0 15px 45px #a64d751c
-}
-h1{text-align:center;color:#d64f83;margin:5px 0 10px}
-.subtitle{text-align:center;color:#987889;font-size:14px;line-height:1.6}
-.heart{text-align:center;font-size:48px}
-label{display:block;font-weight:bold;font-size:14px;margin:16px 0 8px}
-input,textarea{
-  width:100%;padding:13px;border:1px solid #f1cbd9;
-  border-radius:12px;background:#fffafd;font:inherit;color:#513342
-}
-textarea{min-height:145px;resize:vertical}
-button,.btn{
-  display:block;width:100%;padding:14px;margin-top:14px;
-  border:0;border-radius:12px;background:#d64f83;
-  color:white;font-weight:bold;font-size:14px;text-align:center;
-  text-decoration:none;cursor:pointer
-}
-button:disabled{opacity:.6;cursor:wait}
-.secondary{background:#f7dce7;color:#9b3560}
-.quota{
-  margin:18px 0;padding:13px;text-align:center;
-  border-radius:12px;background:#fff1f6;color:#a83e6b;font-size:13px
-}
-.result{
-  display:none;background:#fff1f6;border-radius:15px;
-  padding:18px;margin-top:20px;text-align:center
-}
-.code{font-size:25px;letter-spacing:2px;color:#c83e76;font-weight:bold}
-.note{font-size:12px;color:#987889;line-height:1.6;text-align:center}
-.error{color:#b42345;font-size:13px;margin-top:12px}
-.message{
-  white-space:pre-wrap;overflow-wrap:anywhere;
-  background:#fff1f6;padding:15px;border-radius:12px;
-  line-height:1.6;margin-top:14px
-}
-a{color:#c83e76}
+body{margin:0;padding:20px;background:#f8edf2;font-family:Arial,sans-serif;color:#382b34}
+main{max-width:450px;margin:30px auto;background:white;padding:25px;border-radius:20px;box-shadow:0 5px 25px #0001}
+h1{text-align:center;color:#b34d79;margin-bottom:8px}
+.subtitle{text-align:center;color:#887580;font-size:14px;margin-bottom:25px}
+label{display:block;font-weight:bold;margin-top:17px;font-size:14px}
+input,textarea{width:100%;padding:14px;margin-top:8px;border:1px solid #e4d6de;border-radius:10px;font-size:15px;font-family:Arial}
+textarea{height:125px;resize:vertical}
+button{width:100%;padding:14px;margin-top:22px;border:0;border-radius:10px;background:#b34d79;color:white;font-size:15px;font-weight:bold;cursor:pointer}
+.result{margin-top:18px;padding:16px;background:#fbedf3;border-radius:12px;text-align:center;overflow-wrap:anywhere}
+.result h2{color:#b34d79;letter-spacing:3px}
+.result a{display:block;margin-top:14px;padding:13px;background:#168b55;color:white;border-radius:9px;text-decoration:none;font-weight:bold}
+.small{font-size:12px;color:#887580;line-height:1.5}
 </style>
 </head>
 <body>
-<main class="card">${content}</main>
-${script}
-</body>
-</html>`;
-}
+<main>
+<h1>💌 Secret Love Letter</h1>
+<p class="subtitle">Sampaikan pesan rahasiamu kepada seseorang.</p>
 
-// WEBSITE PENGIRIM BY GALUH XATANIEL
-app.get("/", (req, res) => {
-  const content = `
-  <div class="heart">💌</div>
-  <h1>Secret Love Letter</h1>
-  <p class="subtitle">
+<form id="letterForm">
+<label>1. Nama pengirim</label>
+<input id="sender" maxlength="50" required placeholder="Masukkan nama kamu">
 
-    Kirim surat rahasia By Galuh.
-    Tanpa perlu memasukkan nomor telepon.
-  </p>
+<label>2. Nomor WhatsApp penerima</label>
+<input id="recipient" type="tel" maxlength="20" required placeholder="Contoh: 6281234567890">
 
-  <form id="letterForm">
-  <label>NAMA PENGIRIM!!</label>
-    <input id="sender" maxlength="40"
-      placeholder="Tidak Wajib..">
-      
-    <label>MASUKAN NO CRUSH LO!!</label>
-    <input id="sender" maxlength="15"
-      placeholder="Wajib isi ya sayang..">
+<label>3. Isi surat</label>
+<textarea id="message" maxlength="3000" required placeholder="Tuliskan isi surat rahasiamu..."></textarea>
 
-    <label>ISI SURAT BUAT CRUSH LO!!</label>
-    <textarea id="message" maxlength="1500" required
-      placeholder="Tuliskan pesan dan alasan di sini..."></textarea>
+<label>4. Alasan mengirim surat</label>
+<textarea id="reason" maxlength="1000" required placeholder="Tuliskan alasan kamu mengirim surat ini..."></textarea>
 
-    <button id="submit" type="submit">Buat Surat Rahasia 💗</button>
-  </form>
+<p class="small">Pastikan nomor penerima benar dan kamu memiliki izin untuk menggunakannya.</p>
+<button type="submit">Buat Surat Rahasia 💌</button>
+</form>
 
-  <div class="error" id="error"></div>
+<div id="result"></div>
+</main>
 
-  <section class="result" id="result">
-    <h3>Surat berhasil dibuat! 💖</h3>
-    <p class="note">Berikan kode ini kepada Perantara.</p>
-    <div class="code" id="code"></div>
-    <button type="button" id="copy">Salin Kode</button>
-    <button type="button" class="secondary" id="share">Bagikan Kode</button>
-    <p class="note">Penerima mengirim kode ke nomor WhatsApp perantara.</p>
-  </section>
+<script>
+const form=document.getElementById('letterForm');
+const result=document.getElementById('result');
 
-  <p class="note">Secret Love Letter · By Galuh Xataniel </p>`;
+form.addEventListener('submit',async e=>{
+ e.preventDefault();
+ result.textContent='Sedang membuat surat...';
 
-  const script = `
-  <script>
-  const form=document.getElementById("letterForm");
-  const button=document.getElementById("submit");
-  let currentCode="";
-document.getElementById('share').addEventListener('click', function() {
-    const codeText = document.getElementById('code').innerText;
-    const targetNumber = "6285780322008";
-    const textMessage = encodeURIComponent(\`Halo, ini kode saya 💖: \${codeText}\`);
-    window.open(\`https://wa.me/\${targetNumber}?text=\${textMessage}\`, '_blank');
-});
-  async function updateQuota(){
-    try{
-      const r=await fetch("/api/quota");
-      const q=await r.json();
-      document.getElementById("quota").textContent=
-        q.available
-        ? "💌 Kuota tersedia: "+q.remaining+"/15 pengiriman"
-        : "💗 Kuota penuh. Pengiriman akan tersedia kembali setelah periode 2 jam.";
-    }catch{
-      document.getElementById("quota").textContent="Kuota tidak dapat diperiksa.";
-    }
-  }
-
-  updateQuota();
-
-  form.addEventListener("submit",async e=>{
-    e.preventDefault();
-    button.disabled=true;
-    button.textContent="Menyimpan surat...";
-
-    try{
-      const r=await fetch("/api/letters",{
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({
-          sender:document.getElementById("sender").value,
-          message:document.getElementById("message").value
-        })
-      });
-
-      const d=await r.json();
-      if(!r.ok)throw new Error(d.error||"Gagal menyimpan.");
-
-      currentCode=d.code;
-      document.getElementById("code").textContent=currentCode;
-      document.getElementById("result").style.display="block";
-      document.getElementById("error").textContent="";
-      form.reset();
-    }catch(err){
-      document.getElementById("error").textContent=err.message;
-    }finally{
-      button.disabled=false;
-      button.textContent="Buat Dan Bagikan💗";
-    }
+ try{
+  const response=await fetch('/api/letters',{
+   method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({
+    sender:document.getElementById('sender').value,
+    recipient_number:document.getElementById('recipient').value,
+    message:document.getElementById('message').value,
+    reason:document.getElementById('reason').value
+   })
   });
 
-  document.getElementById("copy").onclick=async()=>{
-    if(!currentCode)return;
-    await navigator.clipboard.writeText(currentCode);
-    document.getElementById("copy").textContent="Berhasil disalin ✓";
-  };
+  const data=await response.json();
+  if(!response.ok)throw new Error(data.error||'Gagal membuat surat');
 
-  document.getElementById("share").onclick=async()=>{
-    if(!currentCode)return;
-    const text="Aku punya surat rahasia untukmu 💌\\nKirim kode "+
-      currentCode+" ke nomor WhatsApp Secret Love Letter.";
-    if(navigator.share){
-      try{await navigator.share({title:"Secret Love Letter",text});}catch{}
-    }else{
-      await navigator.clipboard.writeText(text);
-    }
-  };
-  </script>`;
+  result.innerHTML='';
+  const box=document.createElement('div');
+  box.className='result';
 
-  res.send(page("Secret Love Letter", content, script));
-});
+  const title=document.createElement('strong');
+  title.textContent='Surat berhasil dibuat!';
 
-// API BUAT SURAT
-app.post("/api/letters", createLimiter, (req, res) => {
-  try {
-    const sender = String(req.body.sender || "").trim().slice(0,40);
-    const message = String(req.body.message || "").trim();
+  const code=document.createElement('h2');
+  code.textContent=data.code;
 
-    if (!message || message.length > 1500) {
-      return res.status(400).json({
-        error:"Isi surat harus 1 sampai 1500 karakter."
-      });
-    }
+  const note=document.createElement('p');
+  note.textContent='Simpan kode ini dan kirimkan ke WhatsApp perantara.';
 
-    const now = Date.now();
-    const expires = now + EXPIRY_DAYS * 86400000;
+  box.append(title,code,note);
 
-    let code;
-    let saved = false;
-
-    for (let i=0; i<5; i++) {
-      code=generateCode();
-      try {
-        db.prepare(`
-          INSERT INTO letters(code,sender,message,created_at,expires_at)
-          VALUES(?,?,?,?,?)
-        `).run(code,sender || null,message,now,expires);
-        saved=true;
-        break;
-      } catch (err) {
-        if (i===4) throw err;
-      }
-    }
-
-    if (!saved) throw new Error("Kode gagal dibuat.");
-
-    res.json({success:true,code,expiresInDays:EXPIRY_DAYS});
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({error:"Gagal menyimpan surat."});
-  }
-});
-
-// API KUOTA
-app.get("/api/quota", (req,res)=>{
-  res.json(getQuota());
-});
-
-// HALAMAN ADMIN
-app.get("/admin", (req,res)=>{
-  const content=`
-  <div class="heart">🔐</div>
-  <h1>Admin Panel</h1>
-  <p class="subtitle">Secret Love Letter</p>
-
-  <label>Password admin</label>
-  <input id="adminKey" type="password" autocomplete="current-password"
-    placeholder="Masukkan password admin">
-
-  <label>Kode surat</label>
-  <input id="code" placeholder="SL-K7M9Q2PX">
-
-  <button id="find">Cari Surat</button>
-
-  <div id="quota" class="quota">Memeriksa kuota...</div>
-  <div id="output"></div>
-  <div class="error" id="error"></div>`;
-
-  const script=`
-  }
-}, { once: true });
-  <script>
-  let foundCode="";
-
-  const key=()=>document.getElementById("adminKey").value;
-
-  async function refreshQuota(){
-    const r=await fetch("/api/quota");
-    const q=await r.json();
-    document.getElementById("quota").textContent=
-      "Kuota: "+q.used+"/15 digunakan · Sisa "+q.remaining;
+  if(data.whatsappUrl){
+   const link=document.createElement('a');
+   link.href=data.whatsappUrl;
+   link.target='_blank';
+   link.rel='noopener';
+   link.textContent='Kirim kode ke WhatsApp perantara';
+   box.append(link);
+  }else{
+   const warning=document.createElement('p');
+   warning.textContent='WhatsApp perantara belum dikonfigurasi.';
+   box.append(warning);
   }
 
-  refreshQuota();
-
-  document.getElementById("find").onclick=async()=>{
-    const code=document.getElementById("code").value.trim().toUpperCase();
-    const output=document.getElementById("output");
-    const error=document.getElementById("error");
-    output.innerHTML="";
-    error.textContent="";
-    foundCode="";
-
-    try{
-      const r=await fetch("/api/admin/find",{
-        method:"POST",
-        headers:{
-          "Content-Type":"application/json",
-          "x-admin-key":key()
-        },
-        body:JSON.stringify({code})
-      });
-
-      const d=await r.json();
-      if(!r.ok)throw new Error(d.error||"Gagal mencari surat.");
-
-      foundCode=d.code;
-
-      const message=document.createElement("div");
-      message.className="message";
-      message.textContent=
-        "Kode: "+d.code+"\\nDari: "+(d.sender||"Anonim")+
-        "\\n\\n"+d.message;
-      output.appendChild(message);
-
-      const send=document.createElement("a");
-      send.className="btn";
-      send.target="_blank";
-      send.rel="noopener noreferrer";
-      send.href="https://wa.me/"+${JSON.stringify(process.env.WHATSAPP_NUMBER)}+
-        "?text="+encodeURIComponent(
-          "💌 SURAT RAHASIA UNTUKMU\\n\\nDari: "+
-          (d.sender||"Seseorang yang ingin tetap anonim")+
-          "\\n\\n"+d.message+
-          "\\n\\nSecret Love Letter"
-        );
-      send.textContent="Buka WhatsApp untuk Mengirim";
-      output.appendChild(send);
-
-      const confirm=document.createElement("button");
-      confirm.textContent="Konfirmasi Sudah Terkirim";
-      confirm.onclick=async()=>{
-        confirm.disabled=true;
-        try{
-          const result=await fetch("/api/admin/delivered",{
-            method:"POST",
-            headers:{
-              "Content-Type":"application/json",
-              "x-admin-key":key()
-            },
-            body:JSON.stringify({code:foundCode})
-          });
-          const data=await result.json();
-          if(!result.ok)throw new Error(data.error);
-          output.innerHTML="<p>Surat berhasil dicatat sebagai terkirim ✓</p>";
-          await refreshQuota();
-        }catch(err){
-          error.textContent=err.message;
-          confirm.disabled=false;
-        }
-      };
-      output.appendChild(confirm);
-    }catch(err){
-      error.textContent=err.message;
-    }
-  };
-  </script>`;
-
-  res.send(page("Admin Panel",content,script));
+  result.append(box);
+  form.reset();
+ }catch(error){
+  result.textContent=error.message;
+ }
 });
+</script>
+</body>
+</html>`;
 
-// ADMIN API: CARI SURAT
-app.post("/api/admin/find",adminLimiter,adminOnly,(req,res)=>{
-  const code=String(req.body.code||"").trim().toUpperCase();
+const adminPage = `<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin Secret Love Letter</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:#f8edf2;padding:20px;color:#382b34}
+main{max-width:450px;margin:30px auto;background:white;padding:24px;border-radius:17px}
+h2{color:#b34d79}
+input,button{width:100%;padding:13px;margin-top:12px;border:1px solid #ddd;border-radius:9px}
+button{background:#b34d79;color:white;border:0;font-weight:bold;cursor:pointer}
+a{display:block;background:#168b55;color:white;text-align:center;padding:13px;border-radius:9px;text-decoration:none;margin-top:12px}
+.info{background:#fbedf3;padding:13px;border-radius:10px;margin-top:12px;overflow-wrap:anywhere}
+.message{white-space:pre-wrap;overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<main>
+<h2>🔐 Admin Secret Love Letter</h2>
+<form id="searchForm">
+<input id="key" type="password" placeholder="Masukkan Admin Key" required>
+<input id="code" maxlength="8" placeholder="Masukkan kode surat" required>
+<button type="submit">Cari Surat</button>
+</form>
+<div id="result"></div>
+</main>
 
-  if(!/^SL-[A-Z0-9]{8}$/.test(code)){
-    return res.status(400).json({error:"Format kode tidak valid."});
+<script>
+const form=document.getElementById('searchForm');
+const result=document.getElementById('result');
+
+form.addEventListener('submit',async e=>{
+ e.preventDefault();
+ result.textContent='Mencari surat...';
+
+ try{
+  const response=await fetch('/api/admin/find',{
+   method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({
+    key:document.getElementById('key').value,
+    code:document.getElementById('code').value.trim()
+   })
+  });
+
+  const data=await response.json();
+  if(!response.ok)throw new Error(data.error||'Surat tidak ditemukan');
+
+  result.innerHTML='';
+
+  function addInfo(label,value,extraClass=''){
+   const box=document.createElement('div');
+   box.className='info '+extraClass;
+   const heading=document.createElement('strong');
+   heading.textContent=label;
+   const content=document.createElement('p');
+   content.textContent=value||'-';
+   box.append(heading,content);
+   result.append(box);
   }
 
-  const letter=db.prepare(`
-    SELECT code,sender,message,expires_at
-    FROM letters WHERE code=?
-  `).get(code);
+  addInfo('Kode surat',data.code);
+  addInfo('Nama pengirim',data.sender);
+  addInfo('Nomor penerima',data.recipient_number);
+  addInfo('Isi surat',data.message,'message');
+  addInfo('Alasan mengirim',data.reason,'message');
 
-  if(!letter || letter.expires_at<Date.now()){
-    return res.status(404).json({
-      error:"Surat tidak ditemukan atau sudah kedaluwarsa."
+  if(data.whatsappUrl){
+   const link=document.createElement('a');
+   link.href=data.whatsappUrl;
+   link.target='_blank';
+   link.rel='noopener';
+   link.textContent='Buka WhatsApp untuk mengirim surat';
+   result.append(link);
+  }
+
+  const done=document.createElement('button');
+  done.textContent='Tandai sudah dikirim';
+  done.onclick=async()=>{
+   try{
+    const r=await fetch('/api/admin/delivered',{
+     method:'POST',
+     headers:{'Content-Type':'application/json'},
+     body:JSON.stringify({
+      key:document.getElementById('key').value,
+      code:data.code
+     })
     });
-  }
+    const d=await r.json();
+    alert(d.message||d.error);
+   }catch(err){alert('Gagal menghubungi server');}
+  };
+  result.append(done);
 
-  const delivered=db.prepare(`
-    SELECT id FROM delivery_history WHERE letter_code=?
-  `).get(code);
-
-  if(delivered){
-    return res.status(409).json({error:"Surat sudah terkirim."});
-  }
-
-  res.json(letter);
+ }catch(error){
+  result.textContent=error.message;
+ }
 });
+</script>
+</body>
+</html>`;
 
-// ADMIN API: KONFIRMASI PENGIRIMAN
-app.post("/api/admin/delivered",adminLimiter,adminOnly,(req,res)=>{
-  const code=String(req.body.code||"").trim().toUpperCase();
-  const now=Date.now();
-
-  try{
-    const transaction=db.transaction(()=>{
-      const letter=db.prepare(`
-        SELECT code,expires_at FROM letters WHERE code=?
-      `).get(code);
-
-      if(!letter || letter.expires_at<now){
-        return "not_found";
-      }
-
-      const exists=db.prepare(`
-        SELECT id FROM delivery_history WHERE letter_code=?
-      `).get(code);
-
-      if(exists)return "already_sent";
-
-      const used=db.prepare(`
-        SELECT COUNT(*) AS total FROM delivery_history
-        WHERE delivered_at>?
-      `).get(now-WINDOW_MS).total;
-
-      if(used>=MAX_DELIVERIES)return "quota_full";
-
-      db.prepare(`
-        INSERT INTO delivery_history(letter_code,delivered_at)
-        VALUES(?,?)
-      `).run(code,now);
-
-      return "success";
-    });
-
-    const result=transaction();
-
-    if(result==="not_found")return res.status(404).json({error:"Surat tidak ditemukan."});
-    if(result==="already_sent")return res.status(409).json({error:"Surat sudah terkirim."});
-    if(result==="quota_full")return res.status(429).json({error:"Kuota 15 pengiriman per 2 jam sudah habis."});
-
-    res.json({success:true,quota:getQuota()});
-  }catch(err){
-    console.error(err);
-    res.status(500).json({error:"Gagal mencatat pengiriman."});
+function json(data,status=200){
+ return new Response(JSON.stringify(data),{
+  status,
+  headers:{
+   'Content-Type':'application/json; charset=utf-8',
+   'Cache-Control':'no-store'
   }
-});
-
-// BERSIHKAN SURAT KEDALUWARSA
-function cleanup(){
-  const cutoff=Date.now()-7*86400000;
-
-  db.prepare("DELETE FROM letters WHERE expires_at<?").run(cutoff);
+ });
 }
 
-cleanup();
-setInterval(cleanup,24*60*60*1000).unref();
+function normalizePhone(value){
+ let number=String(value||'').replace(/[^0-9]/g,'');
+ if(number.startsWith('0'))number='62'+number.slice(1);
+ else if(number.startsWith('8'))number='62'+number;
+ if(!/^[1-9][0-9]{7,14}$/.test(number))return null;
+ return number;
+}
 
-app.listen(PORT,()=>{
-  console.log("Secret Love Letter berjalan di port "+PORT);
-});
+function makeCode(){
+ const value=crypto.getRandomValues(new Uint32Array(1))[0];
+ return String(10000000+(value%90000000));
+}
+
+export default {
+ async fetch(request,env){
+  const url=new URL(request.url);
+
+  if(request.method==='GET' && url.pathname==='/'){
+   return new Response(page,{
+    headers:{'Content-Type':'text/html; charset=utf-8'}
+   });
+  }
+
+  if(request.method==='GET' && url.pathname==='/admin'){
+   return new Response(adminPage,{
+    headers:{'Content-Type':'text/html; charset=utf-8'}
+   });
+  }
+
+  if(request.method==='POST' && url.pathname==='/api/letters'){
+   try{
+    const body=await request.json();
+    const sender=String(body.sender||'').trim().slice(0,50);
+    const recipient=normalizePhone(body.recipient_number);
+    const message=String(body.message||'').trim();
+    const reason=String(body.reason||'').trim();
+
+    if(!sender||!recipient||!message||!reason){
+     return json({error:'Semua kolom wajib diisi.'},400);
+    }
+
+    if(message.length>3000||reason.length>1000){
+     return json({error:'Isi surat atau alasan terlalu panjang.'},400);
+    }
+
+    const now=Math.floor(Date.now()/1000);
+    const expiry=now+30*24*60*60;
+    let code;
+    let saved=false;
+
+    for(let attempt=0;attempt<5;attempt++){
+     code=makeCode();
+     try{
+      await env.DB.prepare(
+       'INSERT INTO letters (code,sender,recipient_number,message,reason,created_at,expires_at) VALUES (?,?,?,?,?,?,?)'
+      ).bind(code,sender,recipient,message,reason,now,expiry).run();
+      saved=true;
+      break;
+     }catch(err){
+      // Coba kode baru jika terjadi benturan kode.
+     }
+    }
+
+    if(!saved)return json({error:'Gagal membuat kode. Silakan coba lagi.'},500);
+
+    const intermediary=normalizePhone(env.WHATSAPP_NUMBER||'');
+    const whatsappUrl=intermediary
+     ? 'https://wa.me/'+intermediary+'?text='+encodeURIComponent('Kode surat rahasia saya: '+code)
+     : null;
+
+    return json({ok:true,code,whatsappUrl});
+
+   }catch(error){
+    return json({error:'Tidak dapat menyimpan surat. Periksa database D1.'},500);
+   }
+  }
+
+  if(request.method==='POST' && (
+   url.pathname==='/api/admin/find' ||
+   url.pathname==='/api/admin/delivered'
+  )){
+   try{
+    const body=await request.json();
+
+    if(!env.ADMIN_KEY||body.key!==env.ADMIN_KEY){
+     return json({error:'Admin Key salah.'},401);
+    }
+
+    const code=String(body.code||'').trim();
+    if(!/^[0-9]{8}$/.test(code)){
+     return json({error:'Kode harus terdiri dari 8 angka.'},400);
+    }
+
+    if(url.pathname==='/api/admin/find'){
+     const letter=await env.DB.prepare(
+      'SELECT code,sender,recipient_number,message,reason,expires_at FROM letters WHERE code=?'
+     ).bind(code).first();
+
+     if(!letter||letter.expires_at<Math.floor(Date.now()/1000)){
+      return json({error:'Surat tidak ditemukan atau sudah kedaluwarsa.'},404);
+     }
+
+     const text=
+      'Secret Love Letter 💌\\n'+
+      'Dari: '+letter.sender+'\\n\\n'+
+      'Isi surat:\\n'+letter.message+'\\n\\n'+
+      'Alasan:\\n'+letter.reason;
+
+     const whatsappUrl='https://wa.me/'+letter.recipient_number+
+      '?text='+encodeURIComponent(text);
+
+     return json({...letter,whatsappUrl});
+    }
+
+    await env.DB.prepare(
+     'INSERT INTO delivery_history (letter_code,delivered_at) VALUES (?,?) ON CONFLICT(letter_code) DO UPDATE SET delivered_at=excluded.delivered_at'
+    ).bind(code,Math.floor(Date.now()/1000)).run();
+
+    return json({ok:true,message:'Surat ditandai sudah dikirim.'});
+
+   }catch(error){
+    return json({error:'Terjadi kesalahan pada database.'},500);
+   }
+  }
+
+  return new Response('Not found',{status:404});
+ }
+};
